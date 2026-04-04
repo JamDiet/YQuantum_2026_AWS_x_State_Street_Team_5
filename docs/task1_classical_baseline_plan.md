@@ -103,6 +103,8 @@ X_test_w  = np.clip(X_test, X_train_w.min(axis=0), X_train_w.max(axis=0))
 
 ### 2.2 Standard Scaling
 
+> **Notebook**: Section 3 notes *"Data preprocessing for standardization/bounding could be helpful"*. The notebook's Section 4 example assumes `X_train_s` is already scaled — we implement that here. Variable names match the notebook exactly so the example code drops in directly.
+
 ```python
 from sklearn.preprocessing import StandardScaler
 
@@ -127,6 +129,8 @@ X1, X2, X3, X4
 
 ### 3.2 Polynomial — Degree 2
 
+> **Notebook baseline (Section 4)**: This is the exact approach shown — `PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)` fed into `LinearRegression` and `Ridge(alpha=1.0)`. Replicate this first before adding anything else.
+
 All squared terms and pairwise interactions.
 
 ```python
@@ -139,7 +143,7 @@ poly2 = PolynomialFeatures(degree=2, interaction_only=False, include_bias=False)
 
 Key interactions present in DGP: **X1·X3** (Regime 2 multiplicative signal).
 
-### 3.3 Polynomial — Degree 3 (optional extension)
+### 3.3 Polynomial — Degree 3 *(extension beyond notebook)*
 
 ```python
 poly3 = PolynomialFeatures(degree=3, interaction_only=False, include_bias=False)
@@ -148,9 +152,9 @@ poly3 = PolynomialFeatures(degree=3, interaction_only=False, include_bias=False)
 
 Use only with Lasso or aggressive Ridge. Compare test MSE against degree-2 to check if extra complexity helps.
 
-### 3.4 Log and Absolute Transforms
+### 3.4 Log and Absolute Transforms *(extension beyond notebook)*
 
-Directly targets Regime 2 signal `log(|X2| + 1)`.
+Directly targets Regime 2 signal `log(|X2| + 1)` — present in the DGP but not in the notebook's classical section.
 
 ```python
 def log_abs_features(X: np.ndarray) -> np.ndarray:
@@ -163,7 +167,7 @@ def log_abs_features(X: np.ndarray) -> np.ndarray:
     return np.hstack([abs_X, log_X])
 ```
 
-### 3.5 Sign Features
+### 3.5 Sign Features *(extension beyond notebook)*
 
 Regime 2 Cauchy X2 has symmetric heavy tails — the sign can carry information about which side of the distribution the sample fell on.
 
@@ -173,7 +177,7 @@ def sign_features(X: np.ndarray) -> np.ndarray:
     return np.sign(X)
 ```
 
-### 3.6 Cross-Log Interactions (targeted)
+### 3.6 Cross-Log Interactions *(extension beyond notebook)*
 
 Explicitly encode the nonlinear Regime 2 term as a feature.
 
@@ -239,6 +243,13 @@ The same model class must be used for classical and quantum baselines (per chall
 
 ### 5.1 Model Ladder
 
+> **Notebook baseline (Section 4)** provides three entries directly:
+> - `LR_raw` — `LinearRegression` on raw `X_train_s`
+> - `LR_poly2` — `LinearRegression` on `PolynomialFeatures(degree=2)` output
+> - `Ridge_poly2` — `Ridge(alpha=1.0)` on the same poly features
+>
+> We extend with Lasso (imported in the notebook but unused) and CV-tuned alphas.
+
 Run all four. Compare using out-of-sample MSE, MAE, Pearson correlation.
 
 ```python
@@ -246,10 +257,11 @@ from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.model_selection import cross_val_score
 
 models = {
-    "LR_raw":        LinearRegression(),
-    "LR_classical":  LinearRegression(),        # full feature set, unregularized
-    "Ridge_classical": Ridge(alpha=1.0),        # alpha tuned via CV
-    "Lasso_classical": Lasso(alpha=0.01),       # alpha tuned via CV
+    "LR_raw":          LinearRegression(),       # notebook baseline 1
+    "LR_poly2":        LinearRegression(),       # notebook baseline 2
+    "Ridge_poly2":     Ridge(alpha=1.0),         # notebook baseline 3 (alpha=1.0 as shown)
+    "Ridge_classical": Ridge(alpha=1.0),         # extended features, alpha tuned via CV
+    "Lasso_classical": Lasso(alpha=0.01),        # extended features, alpha tuned via CV
 }
 ```
 
@@ -289,6 +301,8 @@ Label these results clearly as "model complexity extension" — they cannot be c
 ## 6. Evaluation
 
 ### 6.1 Metrics
+
+> **Notebook baseline (Section 4)**: `evaluate_model(y_true, y_pred, label)` returns MSE, MAE, Corr via `pearsonr`. Renamed to `evaluate` for consistency; same logic and return shape.
 
 ```python
 from scipy.stats import pearsonr
@@ -332,13 +346,16 @@ print(df.groupby("model")[["MSE", "MAE", "Pearson_r"]].agg(["mean", "std"]))
 
 ### 6.4 Results Table Template
 
-| Model                  | MSE (mean ± std) | MAE (mean ± std) | Pearson r (mean ± std) |
-|------------------------|------------------|------------------|------------------------|
-| LR — raw features      |                  |                  |                        |
-| LR — classical aug     |                  |                  |                        |
-| Ridge — classical aug  |                  |                  |                        |
-| Lasso — classical aug  |                  |                  |                        |
-| *(quantum aug — TBD)*  |                  |                  |                        |
+Models marked **[nb]** are the three from the notebook's Section 4 example. They must be filled in before any extended models.
+
+| Model                          | MSE (mean ± std) | MAE (mean ± std) | Pearson r (mean ± std) |
+|-------------------------------|------------------|------------------|------------------------|
+| LR — raw features **[nb]**    |                  |                  |                        |
+| LR — poly deg=2 **[nb]**      |                  |                  |                        |
+| Ridge α=1.0 — poly deg=2 **[nb]** |              |                  |                        |
+| Ridge α=CV — classical aug    |                  |                  |                        |
+| Lasso α=CV — classical aug    |                  |                  |                        |
+| *(quantum aug — TBD)*         |                  |                  |                        |
 
 ---
 
@@ -384,16 +401,23 @@ These are the fixed reference numbers that all quantum experiments compare again
 
 ## 9. Implementation Order
 
+Steps 1–5 reproduce the notebook's Section 4 baseline exactly. Steps 6–11 extend it.
+
 ```
+--- Notebook baseline (Section 4) ---
 [ ] 1. generate_regime_data() + sanity checks (distribution plots, regime balance)
-[ ] 2. Winsorize + StandardScaler pipeline
-[ ] 3. build_classical_features() — confirm output shape = (n, 29)
-[ ] 4. LR on raw features — establish floor
-[ ] 5. LR on classical aug features
-[ ] 6. Ridge CV alpha search
-[ ] 7. Lasso CV alpha search
-[ ] 8. Multi-seed loop (5 seeds)
-[ ] 9. Per-regime evaluation
-[ ] 10. Overfitting diagnostics + coefficient plot
-[ ] 11. Freeze results table — handoff to quantum experiments
+[ ] 2. StandardScaler on raw features → X_train_s, X_test_s
+[ ] 3. LR on raw X_train_s — notebook baseline 1, establishes the floor
+[ ] 4. PolynomialFeatures(degree=2) → LR — notebook baseline 2
+[ ] 5. PolynomialFeatures(degree=2) → Ridge(alpha=1.0) — notebook baseline 3
+
+--- Extensions ---
+[ ] 6. Add winsorization before scaling (handles Cauchy X2 outliers)
+[ ] 7. build_classical_features() — add log/abs/sign/cross-log blocks, confirm shape = (n, 29)
+[ ] 8. Ridge CV alpha search on extended features
+[ ] 9. Lasso CV alpha search on extended features
+[ ] 10. Multi-seed loop (5 seeds) across all models
+[ ] 11. Per-regime evaluation on best model
+[ ] 12. Overfitting diagnostics + coefficient importance plot
+[ ] 13. Freeze results table — handoff to quantum experiments
 ```
