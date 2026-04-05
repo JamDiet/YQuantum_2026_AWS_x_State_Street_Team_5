@@ -64,7 +64,8 @@ print(f"PennyLane version: {qml.__version__}")
 # Fallback for running outside Jupyter
 try:
     from IPython.display import display
-except ImportError:
+    display  # force NameError if import succeeded but display is somehow unbound
+except Exception:
     display = print
 
 
@@ -1030,7 +1031,7 @@ _log("Feature diagnostics complete.")
 # ### 3.3 MRU Quantum Circuit (N=15 → Q=4 qubits, r=4, D=2, M=10)
 # 
 
-# In[8]:
+# In[ ]:
 
 
 # ── MRU Configuration ────────────────────────────────────────────────────
@@ -1039,12 +1040,30 @@ Q_MRU, N_FEAT, R_MRU, D_MRU, M_MRU = 4, 15, 4, 2, 10
 # |W| = D * Q * R * 4 params/slot = 2*4*4*4 = 128
 # (slot q3,k=3 is a bias pad: feat_idx=15 >= N_FEAT, so w1*x term is dropped)
 
-if USE_BRAKET:
-    dev_mru = qml.device("braket.local.qubit", backend="default", wires=Q_MRU)
-else:
-    dev_mru = qml.device("default.qubit", wires=Q_MRU)
+# ── JAX backend setup ─────────────────────────────────────────────────────
+# JAX vmap vectorizes the entire mini-batch into one compiled call (~30-100x vs serial loop).
+# Falls back gracefully to serial NumPy if JAX is unavailable or on Braket.
+try:
+    import jax
+    import jax.numpy as jnp
+    jax.config.update("jax_enable_x64", True)   # match NumPy float64 precision
+    _JAX_OK = True
+    print("JAX available — MRU will use vectorized batch evaluation")
+except ImportError:
+    _JAX_OK = False
+    print("JAX not found — falling back to serial NumPy evaluation (slower)")
 
-@qml.qnode(dev_mru, interface="numpy")
+if USE_BRAKET:
+    dev_mru    = qml.device("braket.local.qubit", backend="default", wires=Q_MRU)
+    _INTERFACE = "numpy"
+elif _JAX_OK:
+    dev_mru    = qml.device("default.qubit.jax", wires=Q_MRU)
+    _INTERFACE = "jax"
+else:
+    dev_mru    = qml.device("default.qubit", wires=Q_MRU)
+    _INTERFACE = "numpy"
+
+@qml.qnode(dev_mru, interface=_INTERFACE)
 def mru_circuit(x, W):
     """
     Multiplexed Re-Uploading (MRU) circuit — paper Sec. 3.
@@ -1081,6 +1100,19 @@ def mru_circuit(x, W):
     four   = [qml.expval(qml.PauliZ(0) @ qml.PauliZ(1) @ qml.PauliZ(2) @ qml.PauliZ(3))]
     return single + two + three + four   # 4+6+4+1 = 15
 
+# ── Vectorized batch evaluator ────────────────────────────────────────────
+# With JAX: jit+vmap processes the full batch in one compiled call.
+# Without JAX: plain Python loop (same semantics, slower).
+if _JAX_OK and not USE_BRAKET:
+    _mru_batch_jax = jax.jit(jax.vmap(mru_circuit, in_axes=(0, None)))
+    def _mru_batch(X, W):
+        """Evaluate mru_circuit on all rows of X at once. Returns (N, 15) array."""
+        return np.array(_mru_batch_jax(jnp.array(X), jnp.array(W)))
+else:
+    def _mru_batch(X, W):
+        """Serial fallback — same output shape (N, 15)."""
+        return np.array([mru_circuit(xi, W) for xi in X])
+
 
 def init_W(seed=None):
     """Near-identity init (paper Eq. 12): w1=1, b=0, w0/w2 ~ N(0,0.01)."""
@@ -1093,76 +1125,102 @@ def init_W(seed=None):
 
 
 def extract_mru_features(X, W, obs_idx):
-    """Extract M_MRU features for each row of X using trained W and selected obs_idx."""
-    out = np.zeros((len(X), len(obs_idx)))
-    for i, xi in enumerate(X):
-        all_obs = np.array(mru_circuit(xi, W))
-        out[i] = all_obs[obs_idx]
-    return out
+    """Extract M_MRU features for all rows of X via batched circuit evaluation."""
+    all_obs = _mru_batch(X, W)        # (N, 15) — one vectorized call
+    return all_obs[:, obs_idx]
 
 
 def spsa_train(W_init, X_tr, y_tr, n_steps=50, n_warmup=10,
-               batch=64, a=0.05, c=0.1, A=10, ridge_alpha=1.0, seed=0):
+               batch=16, a=0.05, c=0.1, A=10, ridge_alpha=1.0, seed=0):
     """
     Train MRU via SPSA (paper Sec. 6.3 — 2 circuit evals/step, param-count-independent).
 
     Phase 1 (n_warmup steps): warm up over all 15 observables.
-    Phase 2: variance-rank all 15 observables across X_tr, select top M_MRU (paper Eq. 9),
-             continue training with selected obs for remaining steps.
+    Phase 2: variance-rank observables on a subsample of X_tr, select top M_MRU
+             (paper Eq. 9), continue with selected obs for remaining steps.
 
     SPSA schedule: ak = a/(k+1+A)^0.602, ck = c/(k+1)^0.101
     Returns (W_opt, obs_idx).
     """
     rng = np.random.RandomState(seed)
-    W_flat = W_init.ravel().copy()
+    W_flat   = W_init.ravel().copy()
     n_params = len(W_flat)
-    obs_idx = np.arange(15)          # use all during warmup
+    obs_idx  = np.arange(15)          # use all during warmup
 
     def ridge_loss(W_f, o_idx):
         W_shaped = W_f.reshape(W_init.shape)
-        F = extract_mru_features(X_batch, W_shaped, o_idx)
+        F = extract_mru_features(X_batch, W_shaped, o_idx)   # uses _mru_batch internally
         A_mat = F.T @ F + ridge_alpha * np.eye(len(o_idx))
-        beta = np.linalg.solve(A_mat, F.T @ y_batch)
-        r = y_batch - F @ beta
+        beta  = np.linalg.solve(A_mat, F.T @ y_batch)
+        r     = y_batch - F @ beta
         return float(r @ r) / len(y_batch)
 
     for step in range(n_steps):
         # Variance-ranked selection after warmup (paper Eq. 9)
+        # Use at most 32 samples for selection to cap this one-time overhead.
         if step == n_warmup:
             W_shaped = W_flat.reshape(W_init.shape)
-            F_all = extract_mru_features(X_tr, W_shaped, np.arange(15))
-            obs_idx = np.argsort(F_all.var(axis=0))[::-1][:M_MRU]
+            n_var    = min(32, len(X_tr))
+            var_samp = rng.choice(len(X_tr), size=n_var, replace=False)
+            F_all    = extract_mru_features(X_tr[var_samp], W_shaped, np.arange(15))
+            obs_idx  = np.argsort(F_all.var(axis=0))[::-1][:M_MRU]
 
         # Mini-batch
         idx = rng.choice(len(X_tr), size=min(batch, len(X_tr)), replace=False)
         X_batch, y_batch = X_tr[idx], y_tr[idx]   # closure vars
 
         # SPSA perturbation
-        ak = a / (step + 1 + A) ** 0.602
-        ck = c / (step + 1) ** 0.101
+        ak    = a / (step + 1 + A) ** 0.602
+        ck    = c / (step + 1) ** 0.101
         delta = rng.choice([-1.0, 1.0], size=n_params)
 
         L_plus  = ridge_loss(W_flat + ck * delta, obs_idx)
         L_minus = ridge_loss(W_flat - ck * delta, obs_idx)
-        grad = (L_plus - L_minus) / (2 * ck) * delta
+        grad    = (L_plus - L_minus) / (2 * ck) * delta
         W_flat -= ak * grad
 
     # Final obs selection if n_steps <= n_warmup
     if n_steps <= n_warmup:
         W_shaped = W_flat.reshape(W_init.shape)
-        F_all = extract_mru_features(X_tr, W_shaped, np.arange(15))
-        obs_idx = np.argsort(F_all.var(axis=0))[::-1][:M_MRU]
+        n_var    = min(32, len(X_tr))
+        var_samp = rng.choice(len(X_tr), size=n_var, replace=False)
+        F_all    = extract_mru_features(X_tr[var_samp], W_shaped, np.arange(15))
+        obs_idx  = np.argsort(F_all.var(axis=0))[::-1][:M_MRU]
 
     return W_flat.reshape(W_init.shape), obs_idx
 
 
 # ── Smoke test ────────────────────────────────────────────────────────────
-_W0   = init_W(seed=0)
-_x0   = np.zeros(N_FEAT)
-_out  = np.array(mru_circuit(_x0, _W0))
-_specs = qml.specs(mru_circuit)(_x0, _W0)["resources"]
+_W0  = init_W(seed=0)
+_x0  = np.zeros(N_FEAT)
+_out = _mru_batch(np.array([_x0]), _W0)[0]   # test vectorized call
+
+# Use a plain NumPy circuit for qml.specs (avoids JAX tracing in specs)
+_dev_spec = qml.device("default.qubit", wires=Q_MRU)
+@qml.qnode(_dev_spec, interface="numpy")
+def _mru_for_specs(x, W):
+    for d in range(D_MRU):
+        for q in range(Q_MRU):
+            for k in range(R_MRU):
+                feat_idx = q * R_MRU + k
+                w0, w1, b, w2 = W[d, q, k]
+                qml.RZ(w0, wires=q)
+                if feat_idx < N_FEAT:
+                    qml.RY(w1 * x[feat_idx] + b, wires=q)
+                else:
+                    qml.RY(b, wires=q)
+                qml.RZ(w2, wires=q)
+        if d == 0:
+            qml.CZ(wires=[0,1]); qml.CZ(wires=[1,2])
+            qml.CZ(wires=[2,3]); qml.CZ(wires=[3,0])
+        else:
+            qml.CZ(wires=[0,2]); qml.CZ(wires=[1,3])
+    return [qml.expval(qml.PauliZ(i)) for i in range(Q_MRU)]
+
+_specs = qml.specs(_mru_for_specs)(_x0, _W0)["resources"]
 print(f"MRU circuit: qubits={_specs.num_wires}  depth={_specs.depth}  "
       f"gates={_specs.num_gates}  params={_W0.size}  all_obs={len(_out)}  selected_M={M_MRU}")
+print(f"Batch evaluator: {'JAX jit+vmap' if (_JAX_OK and not USE_BRAKET) else 'NumPy serial'}")
 
 
 # ### 3.4 Walk-Forward Backtest
@@ -1170,95 +1228,193 @@ print(f"MRU circuit: qubits={_specs.num_wires}  depth={_specs.depth}  "
 # In[ ]:
 
 
-# ── 4. Walk-Forward Backtest & Evaluation (Bucket Level) ───────────────
+# ── 4. Walk-Forward Backtest — Classical | Tanh Control | Real MRU ──────────
+# Requires: mru_circuit, init_W, spsa_train, extract_mru_features (defined in MRU section above)
+
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from scipy.stats import spearmanr
 import numpy as np
 import pandas as pd
 from IPython.display import display
 
-LOOKBACK_WINDOW = 104 
-poly2 = PolynomialFeatures(degree=2, include_bias=False)
+# ── Runtime knobs ──────────────────────────────────────────────────────────
+DEBUG_MODE      = True   # True = first 20 windows only; False = all windows
+N_WINDOWS_DEBUG = 20     # windows to run in debug mode
+SPSA_STEPS      = 25     # steps in debug; bump to 50 for full run
+SPSA_WARMUP     = 8
+SPSA_BATCH      = 16
+SPSA_A          = 0.05
+SPSA_C          = 0.1
+SPSA_A_OFFSET   = 10
+RIDGE_ALPHA_MRU = 1.0
+RETRAIN_EVERY_K = 5      # retrain MRU every K windows (1=always; 5=every 5th)
+LOOKBACK_WINDOW = 104
 
-# Group our new buckets together
+poly2_wf = PolynomialFeatures(degree=2, include_bias=False)
+
 buckets = {"Bucket A (AI/Tech)": feat_A, "Bucket B (Alt/Non-Core)": feat_B}
 all_results = []
 
-print(f"Starting Walk-Forward Backtest (Window: {LOOKBACK_WINDOW} days)...")
+print(f"=== Walk-Forward Backtest ===")
+print(f"  DEBUG_MODE={DEBUG_MODE}  N_WINDOWS_DEBUG={N_WINDOWS_DEBUG}  SPSA_STEPS={SPSA_STEPS}")
+print(f"  RETRAIN_EVERY_K={RETRAIN_EVERY_K}  LOOKBACK={LOOKBACK_WINDOW}")
 
 for bucket_name, df in buckets.items():
-    print(f"Processing {bucket_name}...")
-    
+    print(f"\n--- {bucket_name} ---")
+
     feature_cols = [col for col in df.columns if col != 'target']
     X = df[feature_cols].values
     y = df['target'].values
-    
-    # Storage for this bucket's predictions
-    actuals, preds_ridge_s, preds_ridge_q = [], [], []
-    
-    # Walk-forward loop
-    for i in range(LOOKBACK_WINDOW, len(df)):
-        # 1. Split Train/Test with the CRITICAL 5-DAY GAP to prevent lookahead bias
-        X_train_raw = X[i - LOOKBACK_WINDOW : i - 5]
-        y_train = y[i - LOOKBACK_WINDOW : i - 5]
-        
-        X_test_raw = X[i : i+1]
+
+    total_windows = len(df) - LOOKBACK_WINDOW
+    window_range  = range(LOOKBACK_WINDOW, len(df))
+    if DEBUG_MODE:
+        window_range = range(LOOKBACK_WINDOW, LOOKBACK_WINDOW + min(N_WINDOWS_DEBUG, total_windows))
+
+    actuals            = []
+    preds_classical    = []
+    preds_tanh_control = []
+    preds_mru          = []
+
+    # Warm-start state
+    W_prev   = None
+    obs_prev = None
+
+    for loop_i, i in enumerate(window_range):
+        # ── A. Split ──────────────────────────────────────────────────────
+        X_train_raw   = X[i - LOOKBACK_WINDOW : i - 5]
+        y_train_win   = y[i - LOOKBACK_WINDOW : i - 5]
+        X_test_raw    = X[i : i + 1]
         y_test_actual = y[i]
-        
-        # 2. Preprocessing Phase 1: Cauchy Clip -> Standard Scale
-        # Clip train to prevent Cauchy contamination
+
+        # ── B. Classical preprocessing ────────────────────────────────────
         X_tr_clipped = np.clip(X_train_raw, -5, 5)
-        X_te_clipped = np.clip(X_test_raw, -5, 5)
-        
+        X_te_clipped = np.clip(X_test_raw,  -5, 5)
+
         scaler = StandardScaler()
         X_tr_s = scaler.fit_transform(X_tr_clipped)
         X_te_s = scaler.transform(X_te_clipped)
-        
-        # 3. Preprocessing Phase 2: Tanh Squash (for Quantum baseline)
+
+        # ── C. Quantum input branch (bounded) ─────────────────────────────
         X_tr_q = np.pi * np.tanh(X_tr_s / 2)
         X_te_q = np.pi * np.tanh(X_te_s / 2)
-        
-        # 4. Polynomial Expansion (Degree 2)
-        X_tr_p2_s = poly2.fit_transform(X_tr_s)
-        X_te_p2_s = poly2.transform(X_te_s)
-        
-        X_tr_p2_q = poly2.fit_transform(X_tr_q)
-        X_te_p2_q = poly2.transform(X_te_q)
-        
-        # 5. Train & Predict Optimal Classical (Standard Data)
-        ridge_s = Ridge(alpha=1.0).fit(X_tr_p2_s, y_train)
-        preds_ridge_s.append(ridge_s.predict(X_te_p2_s)[0])
-        
-        # 6. Train & Predict Control Classical (Tanh Data)
-        ridge_q = Ridge(alpha=1.0).fit(X_tr_p2_q, y_train)
-        preds_ridge_q.append(ridge_q.predict(X_te_p2_q)[0])
-        
-        actuals.append(y_test_actual)
-        
-    # Evaluate Bucket
-    act = np.array(actuals)
-    
-    all_results.append({
-        "Bucket": bucket_name,
-        "Model": "Ridge Poly2 (Optimal)",
-        "MSE": mean_squared_error(act, preds_ridge_s),
-        "MAE": mean_absolute_error(act, preds_ridge_s),
-        "Corr (IC)": np.corrcoef(act, preds_ridge_s)[0, 1]
-    })
-    
-    all_results.append({
-        "Bucket": bucket_name,
-        "Model": "Ridge Poly2 (Tanh Control)",
-        "MSE": mean_squared_error(act, preds_ridge_q),
-        "MAE": mean_absolute_error(act, preds_ridge_q),
-        "Corr (IC)": np.corrcoef(act, preds_ridge_q)[0, 1]
-    })
 
-# Display Final Leaderboard
+        # ── D. Classical engineered features (poly2 on standard-scaled) ───
+        X_tr_p2 = poly2_wf.fit_transform(X_tr_s)
+        X_te_p2 = poly2_wf.transform(X_te_s)
+
+        # ── Model 1: Classical Ridge Poly2 ────────────────────────────────
+        ridge_cl = Ridge(alpha=RIDGE_ALPHA_MRU).fit(X_tr_p2, y_train_win)
+        preds_classical.append(ridge_cl.predict(X_te_p2)[0])
+
+        # ── Model 2: Tanh Control (poly2 on tanh-squashed inputs) ─────────
+        X_tr_p2_q = poly2_wf.fit_transform(X_tr_q)
+        X_te_p2_q = poly2_wf.transform(X_te_q)
+        ridge_tc  = Ridge(alpha=RIDGE_ALPHA_MRU).fit(X_tr_p2_q, y_train_win)
+        preds_tanh_control.append(ridge_tc.predict(X_te_p2_q)[0])
+
+        # ── Model 3: Classical + Real MRU ─────────────────────────────────
+        win_seed = 42 + loop_i  # deterministic per window
+
+        retrain = (loop_i % RETRAIN_EVERY_K == 0)
+        if retrain:
+            W_init = W_prev if W_prev is not None else init_W(seed=win_seed)
+            W_opt, obs_idx = spsa_train(
+                W_init, X_tr_q, y_train_win,
+                n_steps=SPSA_STEPS,
+                n_warmup=SPSA_WARMUP,
+                batch=min(SPSA_BATCH, len(X_tr_q)),
+                a=SPSA_A, c=SPSA_C, A=SPSA_A_OFFSET,
+                ridge_alpha=RIDGE_ALPHA_MRU,
+                seed=win_seed,
+            )
+            W_prev   = W_opt
+            obs_prev = obs_idx
+        else:
+            W_opt    = W_prev
+            obs_idx  = obs_prev
+
+        Q_tr_mru = extract_mru_features(X_tr_q, W_opt, obs_idx)
+        Q_te_mru = extract_mru_features(X_te_q, W_opt, obs_idx)
+
+        # Concatenate classical poly2 + MRU, then re-standardize jointly
+        Xaug_tr = np.hstack([X_tr_p2, Q_tr_mru])
+        Xaug_te = np.hstack([X_te_p2, Q_te_mru])
+        sc_aug  = StandardScaler()
+        Xaug_tr = sc_aug.fit_transform(Xaug_tr)
+        Xaug_te = sc_aug.transform(Xaug_te)
+
+        ridge_mru = Ridge(alpha=RIDGE_ALPHA_MRU).fit(Xaug_tr, y_train_win)
+        preds_mru.append(ridge_mru.predict(Xaug_te)[0])
+
+        actuals.append(y_test_actual)
+
+        # ── Debug assertions & prints (first 2 windows) ───────────────────
+        if loop_i < 2:
+            assert not np.any(np.isnan(X_tr_q)),   f"NaN in X_tr_q at window {loop_i}"
+            assert not np.any(np.isnan(Q_tr_mru)),  f"NaN in Q_tr_mru at window {loop_i}"
+            assert not np.any(np.isnan(Xaug_tr)),   f"NaN in Xaug_tr at window {loop_i}"
+            assert Q_tr_mru.shape[1] == len(obs_idx), "obs_idx size mismatch"
+            assert X_te_q.shape[0] == 1,             "test sample must be exactly one row"
+            print(f"  [win {loop_i}] X_tr_p2={X_tr_p2.shape}  Q_tr_mru={Q_tr_mru.shape}  "
+                  f"obs_idx={obs_idx}  Q_std_min={Q_tr_mru.std(axis=0).min():.4f}")
+
+        if loop_i % max(1, len(list(window_range)) // 5) == 0:
+            print(f"  window {loop_i}/{len(list(window_range))} done", flush=True)
+
+    # ── Per-bucket metrics for all three models ───────────────────────────
+    act  = np.array(actuals)
+    def bucket_row(name, preds):
+        p = np.array(preds)
+        ic_p = np.corrcoef(act, p)[0, 1] if len(act) > 1 else float('nan')
+        ic_s = spearmanr(act, p).correlation if len(act) > 1 else float('nan')
+        return {
+            "Bucket":          bucket_name,
+            "Model":           name,
+            "MSE":             mean_squared_error(act, p),
+            "MAE":             mean_absolute_error(act, p),
+            "Pearson IC":      ic_p,
+            "Spearman IC":     ic_s,
+            "N_windows":       len(act),
+        }
+
+    all_results.append(bucket_row("Classical Ridge Poly2",    preds_classical))
+    all_results.append(bucket_row("Ridge Poly2 Tanh Control", preds_tanh_control))
+    all_results.append(bucket_row("Ridge Poly2 + MRU",        preds_mru))
+
+# ── Aggregate display ─────────────────────────────────────────────────────
 df_results = pd.DataFrame(all_results)
-print("\n=== Final Classical Baselines (Bucket Level) ===")
-display(df_results.sort_values(by=["Bucket", "MSE"]))
+print("\n=== Walk-Forward Results (All Models) ===")
+display(df_results.sort_values(["Bucket", "Pearson IC"], ascending=[True, False]))
+
+# ── Uplift tables ─────────────────────────────────────────────────────────
+uplift_rows = []
+for bname, grp in df_results.groupby("Bucket"):
+    cl  = grp[grp["Model"] == "Classical Ridge Poly2"]["Pearson IC"].values[0]
+    tc  = grp[grp["Model"] == "Ridge Poly2 Tanh Control"]["Pearson IC"].values[0]
+    mru = grp[grp["Model"] == "Ridge Poly2 + MRU"]["Pearson IC"].values[0]
+    uplift_rows.append({"Bucket": bname, "MRU - Classical": mru - cl, "Tanh - Classical": tc - cl})
+
+df_uplift = pd.DataFrame(uplift_rows)
+print("\n=== IC Uplift vs Classical Baseline ===")
+display(df_uplift)
+
+# ── Build wf_df for plotting ──────────────────────────────────────────────
+cl_rows  = df_results[df_results["Model"] == "Classical Ridge Poly2"].reset_index(drop=True)
+tc_rows  = df_results[df_results["Model"] == "Ridge Poly2 Tanh Control"].reset_index(drop=True)
+mru_rows = df_results[df_results["Model"] == "Ridge Poly2 + MRU"].reset_index(drop=True)
+
+wf_df = pd.DataFrame({
+    "Bucket":          cl_rows["Bucket"],
+    "CL_Corr":         cl_rows["Pearson IC"],
+    "TC_Corr":         tc_rows["Pearson IC"],
+    "MRU_Corr":        mru_rows["Pearson IC"],
+})
+wf_df["MRU_\u0394Corr"] = wf_df["MRU_Corr"] - wf_df["CL_Corr"]
+wf_df["TC_\u0394Corr"]  = wf_df["TC_Corr"]  - wf_df["CL_Corr"]
+print("\n", wf_df.to_string(index=False))
 
 
 # ### 3.5 Walk-Forward Results — Visualisation
@@ -1266,40 +1422,49 @@ display(df_results.sort_values(by=["Bucket", "MSE"]))
 # In[ ]:
 
 
-# Build wf_df for visualisation: pivot df_results into per-bucket CL vs MRU columns
-cl_mask  = df_results['Model'] == 'Ridge Poly2 (Optimal)'
-mru_mask = df_results['Model'] == 'Ridge Poly2 (Tanh Control)'
-wf_df = pd.DataFrame({
-    'Ticker':    df_results[cl_mask]['Bucket'].str.extract(r'Bucket (\w+)')[0].values,
-    'CL_Corr':   df_results[cl_mask]['Corr (IC)'].values,
-    'MRU_Corr':  df_results[mru_mask]['Corr (IC)'].values,
-})
-wf_df['MRU_ΔCorr'] = wf_df['MRU_Corr'] - wf_df['CL_Corr']
-print(wf_df)
+# wf_df is built directly in the walk-forward loop cell above.
+# This cell is a no-op kept to avoid renumbering downstream cells.
+pass
 
 
 # In[ ]:
 
 
+# ── Visualization: IC comparison + uplift bars ────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 x_pos = np.arange(len(wf_df))
-w = 0.35
-axes[0].bar(x_pos - w/2, wf_df["CL_Corr"],  w, label="Classical Ridge", color="#4878CF", alpha=0.85)
-axes[0].bar(x_pos + w/2, wf_df["MRU_Corr"], w, label="Ridge+MRU",       color="#E24A33", alpha=0.85)
-axes[0].set_xticks(x_pos); axes[0].set_xticklabels(wf_df["Ticker"], rotation=45)
+w = 0.25
+labels = wf_df["Bucket"].str.extract(r'Bucket (\w+)')[0].values
+
+axes[0].bar(x_pos - w,   wf_df["CL_Corr"],  w, label="Classical Ridge Poly2",    color="#4878CF", alpha=0.85)
+axes[0].bar(x_pos,       wf_df["TC_Corr"],  w, label="Ridge Poly2 Tanh Control",  color="#6ACC65", alpha=0.85)
+axes[0].bar(x_pos + w,   wf_df["MRU_Corr"], w, label="Ridge Poly2 + MRU",         color="#E24A33", alpha=0.85)
+axes[0].set_xticks(x_pos)
+axes[0].set_xticklabels(labels, rotation=45)
 axes[0].axhline(0, c="k", lw=0.7)
 axes[0].set_ylabel("IC (Pearson Corr)")
-axes[0].set_title("Walk-Forward IC by Stock (MRU vs Classical)")
-axes[0].legend()
+axes[0].set_title("Walk-Forward IC: Classical vs Tanh Control vs Real MRU")
+axes[0].legend(fontsize=8)
 
-axes[1].bar(x_pos, wf_df["MRU_ΔCorr"], w, label="MRU – Classical", color="#E24A33", alpha=0.85)
+axes[1].bar(x_pos - w/2, wf_df["MRU_\u0394Corr"], w, label="MRU \u2013 Classical",         color="#E24A33", alpha=0.85)
+axes[1].bar(x_pos + w/2, wf_df["TC_\u0394Corr"],  w, label="Tanh Control \u2013 Classical", color="#6ACC65", alpha=0.85)
 axes[1].axhline(0, c="k", lw=0.7)
-axes[1].set_xticks(x_pos); axes[1].set_xticklabels(wf_df["Ticker"], rotation=45)
-axes[1].set_ylabel("ΔIC (vs Classical Ridge)")
-axes[1].set_title("MRU Feature Uplift per Stock")
-axes[1].legend()
-plt.tight_layout(); plt.savefig("part2_results.png", bbox_inches='tight'); plt.show()
+axes[1].set_xticks(x_pos)
+axes[1].set_xticklabels(labels, rotation=45)
+axes[1].set_ylabel("\u0394IC vs Classical Ridge")
+axes[1].set_title("Uplift: MRU vs Tanh-Control Preprocessing Only")
+axes[1].legend(fontsize=8)
+
+plt.tight_layout()
+plt.savefig("part2_results.png", bbox_inches='tight')
+plt.show()
+
+print("\n=== Interpretation ===")
+print("  'Tanh Control \u2013 Classical' isolates the effect of bounded preprocessing alone.")
+print("  'MRU \u2013 Classical' is the full quantum feature augmentation effect.")
+print("  If MRU uplift >> Tanh uplift: quantum observables are contributing signal.")
+print("  If MRU uplift \u2248 Tanh uplift: benefit comes from preprocessing, not circuit.")
 
 
 # ---
