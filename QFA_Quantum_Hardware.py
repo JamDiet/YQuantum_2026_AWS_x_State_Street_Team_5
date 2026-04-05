@@ -448,8 +448,8 @@ print(f"Batch: {'JAX jit+vmap' if (_JAX_OK and not USE_BRAKET) else 'NumPy seria
 
 # ── Walk-forward knobs ─────────────────────────────────────────────────────────
 DEBUG_MODE       = False    # True = first 20 windows only
-SPSA_STEPS       = 25
-SPSA_WARMUP      = 8
+SPSA_STEPS       = 250
+SPSA_WARMUP      = 32
 SPSA_BATCH       = 16
 SPSA_A           = 0.05
 SPSA_C           = 0.1
@@ -581,6 +581,106 @@ print(f"  Angle+ZZ  best IC={best_ic:+.4f}  "
       f"R2 best={max([np.corrcoef(Q_te_angle[R_te==2, i], Y_te[R_te==2])[0,1] for i in range(Q_te_angle.shape[1])], key=abs):+.4f}")
 
 print(f"\nAll quantum outputs saved to: {OUTPUT_DIR.resolve()}")
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.stats import spearmanr
+
+# ── Part II: IC Summary Bar + Rolling IC ─────────────────────────────────────
+buckets   = pred_df_out['bucket'].unique()
+ic_pearson  = []
+ic_spearman = []
+for b in buckets:
+    grp = pred_df_out[pred_df_out['bucket'] == b]
+    ic_pearson.append(float(np.corrcoef(grp['y_hat_mru'], grp['actual'])[0, 1]))
+    ic_s, _ = spearmanr(grp['y_hat_mru'], grp['actual'])
+    ic_spearman.append(float(ic_s))
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left: per-bucket IC bars
+x = np.arange(len(buckets))
+w = 0.35
+axes[0].bar(x - w/2, ic_pearson,  w, label='Pearson IC',  color='#E24A33', alpha=0.85)
+axes[0].bar(x + w/2, ic_spearman, w, label='Spearman IC', color='#4878CF', alpha=0.85)
+axes[0].axhline(0, c='k', lw=0.7)
+axes[0].set_xticks(x)
+axes[0].set_xticklabels(buckets, rotation=45)
+axes[0].set_ylabel('IC')
+axes[0].set_title('Part II — MRU Quantum IC by Bucket')
+axes[0].legend(fontsize=9)
+
+# Right: rolling IC over time per bucket
+ROLL = 30
+pred_df_out['date'] = pd.to_datetime(pred_df_out['date'])
+colors = ['#E24A33', '#4878CF', '#6ACC65', '#8B4513']
+for idx_b, b in enumerate(buckets):
+    grp = pred_df_out[pred_df_out['bucket'] == b].sort_values('date')
+    rolling_ic = [
+        float(np.corrcoef(grp['y_hat_mru'].iloc[max(0, i-ROLL):i],
+                          grp['actual'].iloc[max(0, i-ROLL):i])[0, 1])
+        if i >= 5 else float('nan')
+        for i in range(1, len(grp)+1)
+    ]
+    axes[1].plot(grp['date'].values, rolling_ic,
+                 label=b, color=colors[idx_b % len(colors)], lw=1.2)
+axes[1].axhline(0, c='k', lw=0.7, ls='--')
+axes[1].set_ylabel(f'{ROLL}-day Rolling IC')
+axes[1].set_title('Part II — MRU Rolling IC Over Time')
+axes[1].legend(fontsize=9)
+axes[1].tick_params(axis='x', rotation=30)
+
+plt.tight_layout()
+plt.savefig('part2_quantum_ic.png', bbox_inches='tight')
+plt.show()
+print('Saved: part2_quantum_ic.png')
+
+# ── Part II: Predicted vs Actual Scatter per Bucket ───────────────────────────
+n_buckets = len(buckets)
+fig, axes = plt.subplots(1, n_buckets, figsize=(6 * n_buckets, 5))
+if n_buckets == 1:
+    axes = [axes]
+
+for ax, b in zip(axes, buckets):
+    grp = pred_df_out[pred_df_out['bucket'] == b]
+    ic  = float(np.corrcoef(grp['y_hat_mru'], grp['actual'])[0, 1])
+    ax.scatter(grp['y_hat_mru'], grp['actual'], alpha=0.3, s=8, color='#E24A33')
+    # Regression line
+    m, b_ = np.polyfit(grp['y_hat_mru'], grp['actual'], 1)
+    xl = np.linspace(grp['y_hat_mru'].min(), grp['y_hat_mru'].max(), 100)
+    ax.plot(xl, m * xl + b_, 'k--', lw=1.2)
+    ax.set_xlabel('MRU Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title(f'{b}\nIC={ic:+.4f}')
+
+plt.tight_layout()
+plt.savefig('part2_quantum_scatter.png', bbox_inches='tight')
+plt.show()
+print('Saved: part2_quantum_scatter.png')
+
+# ── Part I: Angle+ZZ Feature IC Heatmap ──────────────────────────────────────
+n_obs = Q_te_angle.shape[1]
+feat_labels = ([f'Z{i}' for i in range(4)] +
+               [f'Z{i}Z{j}' for i in range(4) for j in range(i+1, 4)])
+
+ic_all = np.array([np.corrcoef(Q_te_angle[:, i], Y_te)[0, 1] for i in range(n_obs)])
+ic_r1  = np.array([np.corrcoef(Q_te_angle[R_te==1, i], Y_te[R_te==1])[0, 1] for i in range(n_obs)])
+ic_r2  = np.array([np.corrcoef(Q_te_angle[R_te==2, i], Y_te[R_te==2])[0, 1] for i in range(n_obs)])
+
+heatmap_data = np.vstack([ic_all, ic_r1, ic_r2])  # (3, n_obs)
+
+fig, ax = plt.subplots(figsize=(14, 3))
+im = ax.imshow(heatmap_data, aspect='auto', cmap='RdBu_r', vmin=-0.3, vmax=0.3)
+ax.set_yticks([0, 1, 2])
+ax.set_yticklabels(['All', 'Regime 1', 'Regime 2'])
+ax.set_xticks(range(n_obs))
+ax.set_xticklabels(feat_labels, rotation=45, ha='right', fontsize=9)
+ax.set_title('Part I — Angle+ZZ Feature IC with Target (test set)')
+plt.colorbar(im, ax=ax, label='Pearson IC')
+plt.tight_layout()
+plt.savefig('part1_quantum_features.png', bbox_inches='tight')
+plt.show()
+print('Saved: part1_quantum_features.png')
 
 print("=" * 65)
 print("QUANTUM RESOURCE REPORT")
