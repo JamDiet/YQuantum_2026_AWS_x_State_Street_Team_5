@@ -22,7 +22,7 @@
 # ---
 # ## 1. Environment Setup
 
-# In[2]:
+# In[ ]:
 
 
 # Uncomment to install on fresh environment
@@ -52,21 +52,16 @@ plt.rcParams.update({"figure.dpi": 120, "axes.spines.top": False, "axes.spines.r
 USE_BRAKET = False  # Set True when running on AWS Workshop Studio
 
 if USE_BRAKET:
-    dev4  = qml.device("braket.local.qubit", backend="default", wires=4)
-    dev15 = qml.device("braket.local.qubit", backend="default", wires=15)
+    device_arn = "arn:aws:braket:us-west-1::device/qpu/rigetti/Ankaa-3"
+    
+    dev4  = qml.device("braket.aws.qubit", device_arn=device_arn, wires=4)
+    dev15 = qml.device("braket.aws.qubit", device_arn=device_arn, wires=15)
 else:
     dev4  = qml.device("default.qubit", wires=4)
     dev15 = qml.device("default.qubit", wires=15)
 
 print(f"Device: {dev4}")
 print(f"PennyLane version: {qml.__version__}")
-
-# Fallback for running outside Jupyter
-try:
-    from IPython.display import display
-    display  # force NameError if import succeeded but display is somehow unbound
-except Exception:
-    display = print
 
 
 # ---
@@ -258,7 +253,7 @@ print(f"Lasso poly2 best alpha: {alpha_lasso:.3f}")
 
 df_cl = pd.DataFrame(results_p1)
 print("\n=== Classical Baselines (Out-of-Sample) ===")
-display(df_cl.sort_values("MSE"))
+print(df_cl.sort_values("MSE"))
 
 
 # In[ ]:
@@ -282,7 +277,7 @@ results_p1.append(evaluate(y_test, ridge_p2_q.predict(Xte_p2_q), f"Ridge (poly d
 # Build and display the final combined DataFrame
 df_cl = pd.DataFrame(results_p1)
 print("\n=== Final Classical Baselines (With Controls) ===")
-display(df_cl.sort_values("MSE"))
+print(df_cl.sort_values("MSE"))
 
 
 # ### 2.4 Quantum Feature Maps
@@ -459,7 +454,7 @@ for name, Q_tr, Q_te in [("Angle+Entangle", Q_tr_angle, Q_te_angle),
     results_p1.append(evaluate(y_test, preds, f"Ridge+Poly2+{name} (α={alpha})"))
 
 df_all = pd.DataFrame(results_p1)
-display(df_all.sort_values("MSE"))
+print(df_all.sort_values("MSE"))
 
 # ── FIX: Per-Regime Evaluation ─────────────────────────────────────────────
 print("\n=== Per-Regime Breakdown ===")
@@ -493,7 +488,7 @@ for mname, preds in all_preds.items():
 
 df_regime = pd.DataFrame(regime_rows)
 print(f"  Regime 1 test samples: {mask1.sum()}  |  Regime 2 test samples: {mask2.sum()}")
-display(df_regime)
+print(df_regime)
 
 # ── FIX: Multi-Seed Stability ──────────────────────────────────────────────
 print("\n=== Multi-Seed Stability (5 seeds) ===")
@@ -542,7 +537,7 @@ seed_df = pd.DataFrame([
      "Min": round(min(v),4), "Max": round(max(v),4)}
     for k, v in seed_results.items()
 ])
-display(seed_df)
+print(seed_df)
 
 # ── Result Chart ────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(15, 6))
@@ -583,7 +578,7 @@ results_p1.append(evaluate(y_test, preds_spec_p2, f"Ridge+Poly2+Spec (alpha={alp
 # Updated leaderboard
 df_all = pd.DataFrame(results_p1)
 print("\nFull leaderboard including Spec circuit:")
-display(df_all.sort_values("MSE"))
+print(df_all.sort_values("MSE"))
 
 # Per-regime breakdown for Spec
 all_preds["Q+Poly2+Spec"] = preds_spec_p2
@@ -724,8 +719,11 @@ print("Buckets constructed successfully.")
 def extract_16_features(bucket_df, proxies_df, name, proxy1, proxy2):
     f = pd.DataFrame(index=bucket_df.index)
     bc = bucket_df["Close"]
+    bo = bucket_df["Open"]
     bdv = bucket_df["Dollar_Volume"]
     spy_c = proxies_df["Close"]["SPY"]
+    spy_o = proxies_df["Open"]["SPY"]
+    spy_dv = proxies_df["Dollar_Volume"]["SPY"]
     p1_c = proxies_df["Close"][proxy1]
     p2_c = proxies_df["Close"][proxy2]
     
@@ -734,9 +732,22 @@ def extract_16_features(bucket_df, proxies_df, name, proxy1, proxy2):
     
     # Q1: Relative Momentum
     f[f"ret_5_{name}_minus_SPY"] = ret(bc, 5) - ret(spy_c, 5)
-    f[f"ret_20_{name}_minus_SPY"] = ret(bc, 20) - ret(spy_c, 20)
     f[f"ret_60_{name}_minus_SPY"] = ret(bc, 60) - ret(spy_c, 60)
-    f[f"ret_100_{name}_minus_SPY"] = ret(bc, 100) - ret(spy_c, 100)
+    f[f"ret_120_{name}_minus_SPY"] = ret(bc, 120) - ret(spy_c, 120)
+
+    # Illiquidity indicator
+    abs_ret_tic = bc.pct_change().abs()
+    abs_ret_spy = spy_c.pct_change().abs()
+    illiq_tic = (abs_ret_tic / (bc + 1e-9)).rolling(20).mean()
+    illiq_spy = (abs_ret_spy / (spy_dv + 1e-9)).rolling(20).mean()
+    f[f"illiq_20_{name}_over_SPY"] = illiq_tic / illiq_spy
+
+    # Intra-day gap
+    gap_b = (bo - bc.shift(1)) / bo
+    gap_s = (spy_o - spy_c.shift(1)) / spy_o
+    b_z = (gap_b - gap_b.rolling(20).mean()) / (gap_b.rolling(20).std() + 1e-9)
+    gap_z = (gap_s - gap_s.rolling(20).mean()) / (gap_s.rolling(20).std() + 1e-9)
+    f[f"gap_zscore_diff_{name}_vs_SPY"] = b_z - gap_z
     
     # Q2: Internal State
     f[f"rsi10_{name}_minus_SPY"] = compute_rsi(bc) - compute_rsi(spy_c)
@@ -823,8 +834,7 @@ import seaborn as sns
 from sklearn.linear_model import LinearRegression
 import pandas as pd
 import numpy as np
-from IPython.display import display
-
+# display replaced with print for script compatibility\n
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 CORR_WARN    = 0.80   # |pairwise corr| above this  → HIGH_CORR
 VIF_WARN     = 10.0   # VIF above this              → HIGH_VIF
@@ -919,7 +929,7 @@ def feature_diagnostics(feat_df, bucket_name):
          f"| NO_IC={sum('NO_IC' in f for f in flags)} "
          f"| UNSTABLE_IC={sum('UNSTABLE_IC' in f for f in flags)}")
 
-    display(
+    print(
         diag.style
             .background_gradient(subset=["IC"],      cmap="RdYlGn", vmin=-0.08, vmax=0.08)
             .background_gradient(subset=["VIF"],     cmap="YlOrRd", vmin=1,     vmax=20)
@@ -1237,10 +1247,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import spearmanr
 import numpy as np
 import pandas as pd
-from IPython.display import display
-
 # ── Runtime knobs ──────────────────────────────────────────────────────────
-DEBUG_MODE      = True   # True = first 20 windows only; False = all windows
+DEBUG_MODE      = False   # True = first 20 windows only; False = all windows
 N_WINDOWS_DEBUG = 20     # windows to run in debug mode
 SPSA_STEPS      = 25     # steps in debug; bump to 50 for full run
 SPSA_WARMUP     = 8
@@ -1387,7 +1395,7 @@ for bucket_name, df in buckets.items():
 # ── Aggregate display ─────────────────────────────────────────────────────
 df_results = pd.DataFrame(all_results)
 print("\n=== Walk-Forward Results (All Models) ===")
-display(df_results.sort_values(["Bucket", "Pearson IC"], ascending=[True, False]))
+print(df_results.sort_values(["Bucket", "Pearson IC"], ascending=[True, False]))
 
 # ── Uplift tables ─────────────────────────────────────────────────────────
 uplift_rows = []
@@ -1399,7 +1407,7 @@ for bname, grp in df_results.groupby("Bucket"):
 
 df_uplift = pd.DataFrame(uplift_rows)
 print("\n=== IC Uplift vs Classical Baseline ===")
-display(df_uplift)
+print(df_uplift)
 
 # ── Build wf_df for plotting ──────────────────────────────────────────────
 cl_rows  = df_results[df_results["Model"] == "Classical Ridge Poly2"].reset_index(drop=True)
