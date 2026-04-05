@@ -64,7 +64,8 @@ print(f"PennyLane version: {qml.__version__}")
 # Fallback for running outside Jupyter
 try:
     from IPython.display import display
-except ImportError:
+    display  # force NameError if import succeeded but display is somehow unbound
+except Exception:
     display = print
 
 
