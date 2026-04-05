@@ -296,20 +296,14 @@ print(df_cl.sort_values("MSE"))
 
 N_QUBITS = 4
 
-# ── Circuit 1: Angle Encoding + BasicEntanglerLayers ─────────────────────
+# ── Circuit: Angle Encoding + ZZ Entanglement ───────────────────────────
 @qml.qnode(dev4, interface="numpy")
 def angle_circuit(x):
-    qml.AngleEmbedding(x, wires=range(N_QUBITS), rotation="Y")
-    weights = np.zeros((2, N_QUBITS))
-    qml.BasicEntanglerLayers(weights, wires=range(N_QUBITS), rotation=qml.RY)
-    single = [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
-    pairs  = [qml.expval(qml.PauliZ(i) @ qml.PauliZ(j))
-              for i in range(N_QUBITS) for j in range(i+1, N_QUBITS)]
-    return single + pairs
-
-# ── Circuit 2: ZZ Feature Map (Havlíček et al. 2019) ────────────────────
-@qml.qnode(dev4, interface="numpy")
-def zz_circuit(x):
+    # Step 1: Angle embedding — Ry then Rz per qubit, no entanglement
+    for i in range(N_QUBITS):
+        qml.RY(x[i], wires=i)
+        qml.RZ(x[i], wires=i)
+    # Step 2: ZZ feature map in series (entanglement comes from here)
     for rep in range(2):
         for i in range(N_QUBITS):
             qml.Hadamard(wires=i)
@@ -324,63 +318,11 @@ def zz_circuit(x):
               for i in range(N_QUBITS) for j in range(i+1, N_QUBITS)]
     return single + pairs
 
-# ── Circuit 3: IQP Encoding ──────────────────────────────────────────────
-@qml.qnode(dev4, interface="numpy")
-def iqp_circuit(x):
-    qml.IQPEmbedding(x, wires=range(N_QUBITS), n_repeats=2)
-    single = [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
-    pairs  = [qml.expval(qml.PauliZ(i) @ qml.PauliZ(j))
-              for i in range(N_QUBITS) for j in range(i+1, N_QUBITS)]
-    return single + pairs
-
 # ── Quantum Resource Metrics ─────────────────────────────────────────────
-print("=== Quantum Resource Summary ===")
-for name, circ in [("Angle+Entangle", angle_circuit), ("ZZ Feature Map", zz_circuit), ("IQP Encoding", iqp_circuit)]:
-    specs = qml.specs(circ)(X_train_q[0])
-    r = specs["resources"]
-    print(f"  {name:20s}  qubits={r.num_wires}  depth={r.depth}  gates={r.num_gates}  output_features=10")
-
-# ── Draw one circuit ─────────────────────────────────────────────────────
-print("\nZZ Feature Map circuit:")
-print(qml.draw(zz_circuit)(X_train_q[0]))
-
-
-# ── Circuit 4: Spec Circuit (Notes Algorithm — RY-RZ + ZZ phase encoding) ──
-def phi_single(x_row):
-    """Per-feature transformation from spec notes:
-    phi1 = x1 (already z-scored via preprocessing)
-    phi2 = sign(x2) * log(1+|x2|)  -- captures Regime 2 log nonlinearity
-    phi3 = x3, phi4 = x4 (pass-through)
-    """
-    phi = x_row.copy().astype(float)
-    phi[1] = np.sign(x_row[1]) * np.log1p(np.abs(x_row[1]))
-    return phi
-
-@qml.qnode(dev4, interface="numpy")
-def spec_circuit(phi_row):
-    """Notes algorithm: B(x)=RY+RZ block, A(x)=single-Z phases + IsingZZ on pairs (0,1) and (0,2).
-    Returns 5 quantum features: [<Z0>, <Z1>, <Z2>, <Z0Z1>, <Z0Z2>]
-    """
-    # B(x): single-feature nonlinearity -- RY then RZ on every qubit
-    for i in range(N_QUBITS):
-        qml.RY(phi_row[i], wires=i)
-        qml.RZ(phi_row[i], wires=i)
-    # A(x): single-qubit Z-phase terms
-    for i in range(N_QUBITS):
-        qml.RZ(2.0 * phi_row[i], wires=i)
-    # A(x): pairwise ZZ interactions -- only pairs (0,1) and (0,2)
-    qml.IsingZZ(phi_row[0] * phi_row[1], wires=[0, 1])
-    qml.IsingZZ(phi_row[0] * phi_row[2], wires=[0, 2])
-    return [
-        qml.expval(qml.PauliZ(0)),
-        qml.expval(qml.PauliZ(1)),
-        qml.expval(qml.PauliZ(2)),
-        qml.expval(qml.PauliZ(0) @ qml.PauliZ(1)),
-        qml.expval(qml.PauliZ(0) @ qml.PauliZ(2)),
-    ]
-
-print("\nSpec Circuit:")
-print(qml.draw(spec_circuit)(phi_single(X_train_q[0])))
+specs = qml.specs(angle_circuit)(X_train_q[0])
+r = specs["resources"]
+print(f"Angle+ZZ  qubits={r.num_wires}  depth={r.depth}  gates={r.num_gates}  output_features=10")
+print(qml.draw(angle_circuit)(X_train_q[0]))
 
 
 # In[ ]:
@@ -398,21 +340,7 @@ def extract_q_features(circuit_fn, X, label=""):
 print("Extracting quantum features (full 10k train + 10k test)...")
 Q_tr_angle = extract_q_features(angle_circuit, X_train_q, "Angle train")
 Q_te_angle = extract_q_features(angle_circuit, X_test_q,  "Angle test ")
-Q_tr_zz    = extract_q_features(zz_circuit,   X_train_q, "ZZ    train")
-Q_te_zz    = extract_q_features(zz_circuit,   X_test_q,  "ZZ    test ")
-Q_tr_iqp   = extract_q_features(iqp_circuit,  X_train_q, "IQP   train")
-Q_te_iqp   = extract_q_features(iqp_circuit,  X_test_q,  "IQP   test ")
-
 print(f"\nFeature shapes: {Q_tr_angle.shape}  (N_samples × 10 quantum features)")
-
-
-# Spec circuit: apply phi transform (log-signed x2) then extract 5 quantum features
-print("\nExtracting Spec circuit features...")
-X_train_phi = np.array([phi_single(x) for x in X_train_q])
-X_test_phi  = np.array([phi_single(x) for x in X_test_q])
-Q_tr_spec = extract_q_features(spec_circuit, X_train_phi, "Spec   train")
-Q_te_spec = extract_q_features(spec_circuit, X_test_phi,  "Spec   test ")
-print(f"Spec feature shapes: {Q_tr_spec.shape}  (N_samples x 5 quantum features)")
 
 
 # ### 2.5 Results — Synthetic Task
@@ -440,16 +368,12 @@ def augment_and_fit(X_tr_cl, X_te_cl, Q_tr, Q_te, y_tr, label):
     ridge, alpha = tune_ridge(Xaug_tr, y_tr)
     return ridge.predict(Xaug_te), alpha
 
-for name, Q_tr, Q_te in [("Angle+Entangle", Q_tr_angle, Q_te_angle),
-                           ("ZZ Feature Map", Q_tr_zz,   Q_te_zz),
-                           ("IQP Encoding",   Q_tr_iqp,  Q_te_iqp)]:
+for name, Q_tr, Q_te in [("Angle+ZZ", Q_tr_angle, Q_te_angle)]:
     preds, alpha = augment_and_fit(X_train_s, X_test_s, Q_tr, Q_te, y_train, name)
     results_p1.append(evaluate(y_test, preds, f"Ridge+{name} (α={alpha})"))
 
 # Poly2 + Quantum
-for name, Q_tr, Q_te in [("Angle+Entangle", Q_tr_angle, Q_te_angle),
-                           ("ZZ Feature Map", Q_tr_zz,   Q_te_zz),
-                           ("IQP Encoding",   Q_tr_iqp,  Q_te_iqp)]:
+for name, Q_tr, Q_te in [("Angle+ZZ", Q_tr_angle, Q_te_angle)]:
     preds, alpha = augment_and_fit(Xtr_p2, Xte_p2, Q_tr, Q_te, y_train, name)
     results_p1.append(evaluate(y_test, preds, f"Ridge+Poly2+{name} (α={alpha})"))
 
@@ -464,9 +388,7 @@ best_models = df_all.sort_values("MSE").head(6)["Model"].tolist()
 regime_rows = []
 all_preds = {}
 # Re-generate predictions for top models
-for name, Q_tr, Q_te in [("Angle+Entangle", Q_tr_angle, Q_te_angle),
-                           ("ZZ Feature Map", Q_tr_zz,   Q_te_zz),
-                           ("IQP Encoding",   Q_tr_iqp,  Q_te_iqp)]:
+for name, Q_tr, Q_te in [("Angle+ZZ", Q_tr_angle, Q_te_angle)]:
     Xaug_tr = StandardScaler().fit_transform(np.hstack([Xtr_p2, Q_tr]))
     Xaug_te = StandardScaler().fit(np.hstack([Xtr_p2, Q_tr])).transform(np.hstack([Xte_p2, Q_te]))
     sc2 = StandardScaler()
@@ -565,28 +487,6 @@ axes[0].legend(handles=legend_elements, loc='lower right')
 plt.tight_layout(); plt.savefig("part1_results.png", bbox_inches='tight'); plt.show()
 
 
-# ── Spec Circuit Results ──────────────────────────────────────────────────
-print("\n=== Spec Circuit Augmented Results ===")
-# Raw + Spec
-preds_spec_raw, alpha_spec_raw = augment_and_fit(X_train_s, X_test_s, Q_tr_spec, Q_te_spec, y_train, "Spec")
-results_p1.append(evaluate(y_test, preds_spec_raw, f"Ridge+Spec (alpha={alpha_spec_raw})"))
-
-# Poly2 + Spec
-preds_spec_p2, alpha_spec_p2 = augment_and_fit(Xtr_p2, Xte_p2, Q_tr_spec, Q_te_spec, y_train, "Spec")
-results_p1.append(evaluate(y_test, preds_spec_p2, f"Ridge+Poly2+Spec (alpha={alpha_spec_p2})"))
-
-# Updated leaderboard
-df_all = pd.DataFrame(results_p1)
-print("\nFull leaderboard including Spec circuit:")
-print(df_all.sort_values("MSE"))
-
-# Per-regime breakdown for Spec
-all_preds["Q+Poly2+Spec"] = preds_spec_p2
-print("\n=== Spec Circuit Per-Regime Breakdown ===")
-preds = all_preds["Q+Poly2+Spec"]
-r1 = evaluate(y_test[mask1], preds[mask1], "Q+Poly2+Spec R1")
-r2 = evaluate(y_test[mask2], preds[mask2], "Q+Poly2+Spec R2")
-print(f"  R1 MSE={r1['MSE']:.4f} Corr={r1['Corr']:.4f} | R2 MSE={r2['MSE']:.4f} Corr={r2['Corr']:.4f}")
 
 
 # ---
@@ -685,6 +585,7 @@ def build_bucket(df_raw, weights):
     idx = df_raw.index
     bucket_ret = pd.Series(0.0, index=idx)
     bucket_dv = pd.Series(0.0, index=idx)
+    open_gap  = pd.Series(0.0, index=idx)
     
     for tic, w in weights.items():
         # Sum weighted returns
@@ -692,14 +593,23 @@ def build_bucket(df_raw, weights):
         bucket_ret += w * ret_i.fillna(0)
         # Sum weighted dollar volume
         bucket_dv += w * (df_raw["Close"][tic] * df_raw["Volume"][tic])
+        # Weighted open-gap (open vs prev close)
+        g = (df_raw["Open"][tic] / df_raw["Close"][tic].shift(1)) - 1
+        open_gap += w * g.fillna(0)
         
     # Reconstruct Close price starting at 100
     bucket_close = [100.0]
     for r in bucket_ret.iloc[1:]:
         bucket_close.append(bucket_close[-1] * (1 + r))
+    
+    # Reconstruct Open price: prev_close * (1 + open_gap)
+    bucket_open = [bucket_close[0]]
+    for i in range(1, len(bucket_close)):
+        bucket_open.append(bucket_close[i-1] * (1 + open_gap.iloc[i]))
         
     bucket_df = pd.DataFrame(index=idx)
     bucket_df["Close"] = bucket_close
+    bucket_df["Open"]  = bucket_open
     bucket_df["Dollar_Volume"] = bucket_dv
     return bucket_df
 
@@ -723,7 +633,7 @@ def extract_16_features(bucket_df, proxies_df, name, proxy1, proxy2):
     bdv = bucket_df["Dollar_Volume"]
     spy_c = proxies_df["Close"]["SPY"]
     spy_o = proxies_df["Open"]["SPY"]
-    spy_dv = proxies_df["Dollar_Volume"]["SPY"]
+    spy_dv = proxies_df["Close"]["SPY"] * proxies_df["Volume"]["SPY"]
     p1_c = proxies_df["Close"][proxy1]
     p2_c = proxies_df["Close"][proxy2]
     
@@ -1067,7 +977,7 @@ if USE_BRAKET:
     dev_mru    = qml.device("braket.local.qubit", backend="default", wires=Q_MRU)
     _INTERFACE = "numpy"
 elif _JAX_OK:
-    dev_mru    = qml.device("default.qubit.jax", wires=Q_MRU)
+    dev_mru    = qml.device("default.qubit", wires=Q_MRU)
     _INTERFACE = "jax"
 else:
     dev_mru    = qml.device("default.qubit", wires=Q_MRU)
@@ -1117,7 +1027,10 @@ if _JAX_OK and not USE_BRAKET:
     _mru_batch_jax = jax.jit(jax.vmap(mru_circuit, in_axes=(0, None)))
     def _mru_batch(X, W):
         """Evaluate mru_circuit on all rows of X at once. Returns (N, 15) array."""
-        return np.array(_mru_batch_jax(jnp.array(X), jnp.array(W)))
+        out = _mru_batch_jax(jnp.array(X), jnp.array(W))
+        if isinstance(out, (list, tuple)):
+            out = jnp.stack(out, axis=1)  # PennyLane returns tuple of (batch,) per obs
+        return np.array(out)
 else:
     def _mru_batch(X, W):
         """Serial fallback — same output shape (N, 15)."""
@@ -1484,9 +1397,7 @@ print("  If MRU uplift \u2248 Tanh uplift: benefit comes from preprocessing, not
 print("=== Quantum Resource Summary ===\n")
 
 print("Part I — 4-qubit circuits:")
-for name, circ, x_in in [("Angle+Entangle", angle_circuit, X_train_q[0]),
-                           ("ZZ Feature Map",  zz_circuit,   X_train_q[0]),
-                           ("IQP Encoding",    iqp_circuit,  X_train_q[0])]:
+for name, circ, x_in in [("Angle+ZZ", angle_circuit, X_train_q[0])]:
     s = qml.specs(circ)(x_in)["resources"]
     print(f"  {name:20s}  qubits={s.num_wires}  depth={s.depth:3d}  "
           f"gates={s.num_gates:3d}  output_features=10")
@@ -1522,7 +1433,7 @@ print(f"  Stocks with positive MRU ΔIC: {(wf_df['MRU_ΔCorr'] > 0).sum()}/10")
 # 
 # | Finding | Detail |
 # |---|---|
-# | **Quantum alone underperforms poly3** | Angle+Entangle ridge gives MSE=3.26 vs poly3 MSE=1.22 |
+# | **Quantum alone underperforms poly3** | Angle+ZZ ridge gives MSE=3.26 vs poly3 MSE=1.22 |
 # | **Quantum adds value over poly2** | Ridge+Poly2+Angle: MSE=1.445 vs Ridge+Poly2: MSE=1.627 (−11%) |
 # | **IQP and ZZ provide modest uplift** | When combined with poly2, all quantum maps improve over raw poly2 |
 # | **Key driver** | ZZ cross-feature encoding captures $X_1 \cdot X_3$ interactions driving Regime 2 |
@@ -1550,7 +1461,7 @@ print(f"  Stocks with positive MRU ΔIC: {(wf_df['MRU_ΔCorr'] > 0).sum()}/10")
 # 
 # | Circuit | Qubits | Depth | Output | Trainable Params | Hardware |
 # |---|---|---|---|---|---|
-# | Angle+Entangle (Part I) | 4 | 2 | 10 | 0 | Any NISQ |
+# | Angle+ZZ (Part I) | 4 | 2 | 10 | 0 | Any NISQ |
 # | ZZ Feature Map (Part I) | 4 | 31 | 10 | 0 | Deep NISQ |
 # | IQP Encoding (Part I) | 4 | 1 | 10 | 0 | Any NISQ |
 # | **MRU (Part II)** | **4** | **~12** | **10** | **128** | **IonQ Aria-1** |
